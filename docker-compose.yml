@@ -23,6 +23,7 @@ services:
         -Darchaius.configurationSource.additionalUrls=file:///opt/zuul/config/zuul.properties
         -Deureka.client.serviceUrl.defaultZone=http://eureka:8761/eureka
         -Dzuul.server.port.psk=7002
+        -Dio.netty.noPreferDirect=true
         ${EXTRA_JVM_OPTS:-}
     ports:
       - "7001:7001"

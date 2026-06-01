@@ -1,5 +1,5 @@
 /*
- * Copyright 2022 Netflix, Inc.
+ * Copyright 2018 Netflix, Inc.
  *
  *      Licensed under the Apache License, Version 2.0 (the "License");
  *      you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
  *      limitations under the License.
  */
 
-package com.netflix.zuul.integration.server;
+package com.netflix.zuul.sample;
 
 import com.netflix.appinfo.ApplicationInfoManager;
 import com.netflix.config.DynamicIntProperty;
@@ -42,39 +42,46 @@ import com.netflix.zuul.netty.server.ZuulServerChannelInitializer;
 import com.netflix.zuul.netty.server.http2.Http2SslChannelInitializer;
 import com.netflix.zuul.netty.server.push.PushConnectionRegistry;
 import com.netflix.zuul.netty.ssl.BaseSslContextFactory;
+import com.netflix.zuul.netty.server.psk.HardcodedPskProvider;
+import com.netflix.zuul.netty.server.psk.TlsPskHandler;
+import com.netflix.zuul.sample.push.SamplePushMessageSenderInitializer;
+import com.netflix.zuul.sample.push.SampleSSEPushChannelInitializer;
+import com.netflix.zuul.sample.push.SampleWebSocketPushChannelInitializer;
+import io.netty.channel.Channel;
 import io.netty.channel.ChannelInitializer;
-import io.netty.channel.ChannelPipeline;
 import io.netty.channel.group.ChannelGroup;
-import io.netty.handler.codec.compression.CompressionOptions;
-import io.netty.handler.codec.http.HttpContentCompressor;
 import io.netty.handler.ssl.ClientAuth;
-import jakarta.inject.Inject;
-import jakarta.inject.Singleton;
 import java.io.File;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 
-@Singleton
-public class ServerStartup extends BaseServerStartup {
+/**
+ * Sample Server Startup - class that configures the Netty server startup settings
+ *
+ * Author: Arthur Gonigberg
+ * Date: November 20, 2017
+ */
+public class SampleServerStartup extends BaseServerStartup {
 
     enum ServerType {
         HTTP,
         HTTP2,
         HTTP_MUTUAL_TLS,
         WEBSOCKET,
-        SSE
+        SSE,
+        PSK
     }
 
     private static final String[] WWW_PROTOCOLS = new String[] {"TLSv1.3", "TLSv1.2", "TLSv1.1", "TLSv1", "SSLv3"};
-    private static final ServerType SERVER_TYPE = ServerType.HTTP;
+    private static final ServerType SERVER_TYPE = ServerType.PSK;
     private final PushConnectionRegistry pushConnectionRegistry;
-    //    private final SamplePushMessageSenderInitializer pushSenderInitializer;
+    private final SamplePushMessageSenderInitializer pushSenderInitializer;
 
-    @Inject
-    public ServerStartup(
+    public SampleServerStartup(
             ServerStatusManager serverStatusManager,
             FilterLoader filterLoader,
             SessionContextDecorator sessionCtxDecorator,
@@ -86,7 +93,8 @@ public class ServerStartup extends BaseServerStartup {
             EurekaClient discoveryClient,
             ApplicationInfoManager applicationInfoManager,
             AccessLogPublisher accessLogPublisher,
-            PushConnectionRegistry pushConnectionRegistry) {
+            PushConnectionRegistry pushConnectionRegistry,
+            SamplePushMessageSenderInitializer pushSenderInitializer) {
         super(
                 serverStatusManager,
                 filterLoader,
@@ -101,7 +109,7 @@ public class ServerStartup extends BaseServerStartup {
                 applicationInfoManager,
                 accessLogPublisher);
         this.pushConnectionRegistry = pushConnectionRegistry;
-        // this.pushSenderInitializer = pushSenderInitializer;
+        this.pushSenderInitializer = pushSenderInitializer;
     }
 
     @Override
@@ -112,10 +120,9 @@ public class ServerStartup extends BaseServerStartup {
         {
             int port = new DynamicIntProperty("zuul.server.port.main", 7001).get();
             sockAddr = new SocketAddressProperty("zuul.server.addr.main", "=" + port).getValue();
-            if (sockAddr instanceof InetSocketAddress) {
-                metricId = String.valueOf(((InetSocketAddress) sockAddr).getPort());
+            if (sockAddr instanceof InetSocketAddress inetSocketAddress) {
+                metricId = String.valueOf(inetSocketAddress.getPort());
             } else {
-                // Just pick something.   This would likely be a UDS addr or a LocalChannel addr.
                 metricId = sockAddr.toString();
             }
         }
@@ -126,42 +133,33 @@ public class ServerStartup extends BaseServerStartup {
             pushSockAddr = new SocketAddressProperty("zuul.server.addr.http.push", "=" + pushPort).getValue();
         }
 
+        SocketAddress pskSockAddr;
+        {
+            int pskPort = new DynamicIntProperty("zuul.server.port.psk", 7002).get();
+            pskSockAddr = new SocketAddressProperty("zuul.server.addr.psk", "=" + pskPort).getValue();
+        }
+
         String mainListenAddressName = "main";
         ServerSslConfig sslConfig;
         ChannelConfig channelConfig = defaultChannelConfig(mainListenAddressName);
         ChannelConfig channelDependencies = defaultChannelDependencies(mainListenAddressName);
 
-        /* These settings may need to be tweaked depending if you're running behind an ELB HTTP listener, TCP listener,
-         * or directly on the internet.
-         */
         switch (SERVER_TYPE) {
-            /* The below settings can be used when running behind an ELB HTTP listener that terminates SSL for you
-             * and passes XFF headers.
-             */
-            case HTTP:
+            case HTTP -> {
                 channelConfig.set(
                         CommonChannelConfigKeys.allowProxyHeadersWhen,
-                        StripUntrustedProxyHeadersHandler.AllowWhen.ALWAYS);
+                        StripUntrustedProxyHeadersHandler.AllowWhen.NEVER);
                 channelConfig.set(CommonChannelConfigKeys.preferProxyProtocolForClientIp, false);
                 channelConfig.set(CommonChannelConfigKeys.isSSlFromIntermediary, false);
                 channelConfig.set(CommonChannelConfigKeys.withProxyProtocol, false);
 
                 addrsToChannels.put(
                         new NamedSocketAddress("http", sockAddr),
-                        new ZuulServerChannelInitializer(metricId, channelConfig, channelDependencies, clientChannels) {
-                            @Override
-                            protected void addHttp1Handlers(ChannelPipeline pipeline) {
-                                super.addHttp1Handlers(pipeline);
-                                pipeline.addLast(new HttpContentCompressor((CompressionOptions[]) null));
-                            }
-                        });
+                        new ZuulServerChannelInitializer(metricId, channelConfig, channelDependencies, clientChannels));
                 logAddrConfigured(sockAddr);
-                break;
+            }
 
-            /* The below settings can be used when running behind an ELB TCP listener with proxy protocol, terminating
-             * SSL in Zuul.
-             */
-            case HTTP2:
+            case HTTP2 -> {
                 sslConfig = ServerSslConfig.builder()
                         .protocols(WWW_PROTOCOLS)
                         .ciphers(ServerSslConfig.getDefaultCiphers())
@@ -184,15 +182,9 @@ public class ServerStartup extends BaseServerStartup {
                         new NamedSocketAddress("http2", sockAddr),
                         new Http2SslChannelInitializer(metricId, channelConfig, channelDependencies, clientChannels));
                 logAddrConfigured(sockAddr, sslConfig);
-                break;
+            }
 
-            /* The below settings can be used when running behind an ELB TCP listener with proxy protocol, terminating
-             * SSL in Zuul.
-             *
-             * Can be tested using certs in resources directory:
-             *  curl https://localhost:7001/test -vk --cert src/main/resources/ssl/client.cert:zuul123 --key src/main/resources/ssl/client.key
-             */
-            case HTTP_MUTUAL_TLS:
+            case HTTP_MUTUAL_TLS -> {
                 sslConfig = ServerSslConfig.builder()
                         .protocols(WWW_PROTOCOLS)
                         .ciphers(ServerSslConfig.getDefaultCiphers())
@@ -218,11 +210,9 @@ public class ServerStartup extends BaseServerStartup {
                         new Http1MutualSslChannelInitializer(
                                 metricId, channelConfig, channelDependencies, clientChannels));
                 logAddrConfigured(sockAddr, sslConfig);
-                break;
+            }
 
-            /* Settings to be used when running behind an ELB TCP listener with proxy protocol as a Push notification
-             * server using WebSockets */
-            case WEBSOCKET:
+            case WEBSOCKET -> {
                 channelConfig.set(
                         CommonChannelConfigKeys.allowProxyHeadersWhen,
                         StripUntrustedProxyHeadersHandler.AllowWhen.NEVER);
@@ -232,21 +222,17 @@ public class ServerStartup extends BaseServerStartup {
 
                 channelDependencies.set(ZuulDependencyKeys.pushConnectionRegistry, pushConnectionRegistry);
 
-                /*
                 addrsToChannels.put(
                         new NamedSocketAddress("websocket", sockAddr),
                         new SampleWebSocketPushChannelInitializer(
-                                metricId, channelConfig, channelDependencies, clientChannels)); */
+                                metricId, channelConfig, channelDependencies, clientChannels));
                 logAddrConfigured(sockAddr);
 
-                // port to accept push message from the backend, should be accessible on internal network only.
-                // TODO ? addrsToChannels.put(new NamedSocketAddress("http.push", pushSockAddr), pushSenderInitializer);
+                addrsToChannels.put(new NamedSocketAddress("http.push", pushSockAddr), pushSenderInitializer);
                 logAddrConfigured(pushSockAddr);
-                break;
+            }
 
-            /* Settings to be used when running behind an ELB TCP listener with proxy protocol as a Push notification
-             * server using Server Sent Events (SSE) */
-            case SSE:
+            case SSE -> {
                 channelConfig.set(
                         CommonChannelConfigKeys.allowProxyHeadersWhen,
                         StripUntrustedProxyHeadersHandler.AllowWhen.NEVER);
@@ -256,16 +242,61 @@ public class ServerStartup extends BaseServerStartup {
 
                 channelDependencies.set(ZuulDependencyKeys.pushConnectionRegistry, pushConnectionRegistry);
 
-                /*
                 addrsToChannels.put(
                         new NamedSocketAddress("sse", sockAddr),
                         new SampleSSEPushChannelInitializer(
-                                metricId, channelConfig, channelDependencies, clientChannels)); */
+                                metricId, channelConfig, channelDependencies, clientChannels));
                 logAddrConfigured(sockAddr);
-                // port to accept push message from the backend, should be accessible on internal network only.
-                // todo ? addrsToChannels.put(new NamedSocketAddress("http.push", pushSockAddr), pushSenderInitializer);
+
+                addrsToChannels.put(new NamedSocketAddress("http.push", pushSockAddr), pushSenderInitializer);
                 logAddrConfigured(pushSockAddr);
-                break;
+            }
+
+            // ── PSK: plain HTTP on 7001 + vulnerable TlsPskHandler on 7002 ─────────
+            case PSK -> {
+                // Plain HTTP on port 7001 so /healthcheck routing works normally
+                channelConfig.set(
+                        CommonChannelConfigKeys.allowProxyHeadersWhen,
+                        StripUntrustedProxyHeadersHandler.AllowWhen.NEVER);
+                channelConfig.set(CommonChannelConfigKeys.preferProxyProtocolForClientIp, false);
+                channelConfig.set(CommonChannelConfigKeys.isSSlFromIntermediary, false);
+                channelConfig.set(CommonChannelConfigKeys.withProxyProtocol, false);
+
+                addrsToChannels.put(
+                        new NamedSocketAddress("http", sockAddr),
+                        new ZuulServerChannelInitializer(metricId, channelConfig, channelDependencies, clientChannels));
+                logAddrConfigured(sockAddr);
+
+                // PSK listener on 7002 — TlsPskHandler sits in front of the normal
+                // ZuulServerChannelInitializer pipeline. The bug is in TlsPskHandler.write:
+                // it calls TlsPskUtils.getAppDataBytesAndRelease which returns the full
+                // backing array (pool chunk capacity) and frees it before use.
+                ChannelConfig pskCfg = defaultChannelConfig("psk");
+                ChannelConfig pskDeps = defaultChannelDependencies("psk");
+                pskCfg.set(CommonChannelConfigKeys.allowProxyHeadersWhen,
+                        StripUntrustedProxyHeadersHandler.AllowWhen.NEVER);
+                pskCfg.set(CommonChannelConfigKeys.preferProxyProtocolForClientIp, false);
+                pskCfg.set(CommonChannelConfigKeys.isSSlFromIntermediary, false);
+                pskCfg.set(CommonChannelConfigKeys.withProxyProtocol, false);
+
+                ZuulServerChannelInitializer httpInit =
+                        new ZuulServerChannelInitializer("7002", pskCfg, pskDeps, clientChannels);
+                HardcodedPskProvider pskProvider = new HardcodedPskProvider();
+
+                addrsToChannels.put(
+                        new NamedSocketAddress("psk", pskSockAddr),
+                        new ChannelInitializer<Channel>() {
+                            @Override
+                            protected void initChannel(Channel ch) throws Exception {
+                                // TlsPskHandler adds TlsPskDecoder before itself via handlerAdded.
+                                // Inbound: TlsPskDecoder decrypts → passes plain HTTP to Zuul pipeline.
+                                // Outbound: TlsPskHandler.write encrypts — this is the buggy path.
+                                ch.pipeline().addLast(new TlsPskHandler(registry, pskProvider, Set.of()));
+                                httpInit.initChannel(ch);
+                            }
+                        });
+                logAddrConfigured(pskSockAddr);
+            }
         }
 
         return Collections.unmodifiableMap(addrsToChannels);
