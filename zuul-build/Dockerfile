@@ -1,8 +1,8 @@
 # Builder image: use a JDK image and run the Gradle wrapper present in /zuul
 FROM eclipse-temurin:21-jdk AS builder
 
-# Install git and unzip (used by gradle wrapper/plugins)
-RUN apt-get update && apt-get install -y --no-install-recommends git unzip && rm -rf /var/lib/apt/lists/*
+# Install git, unzip, and wget (used by gradle wrapper/plugins and to download wrapper jar if needed)
+RUN apt-get update && apt-get install -y --no-install-recommends git unzip wget && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
 
@@ -15,6 +15,19 @@ COPY .git /workspace/zuul/.git
 WORKDIR /workspace/zuul
 
 RUN chmod +x ./gradlew || true
+
+# Ensure gradle wrapper jar exists. If it's missing (not in git due to .gitignore),
+# download it manually from the gradle distribution mirror.
+RUN if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then \
+    mkdir -p gradle/wrapper && \
+    wget -q -O gradle/wrapper/gradle-wrapper.jar https://services.gradle.org/distributions/gradle-wrapper-9.2.1.jar && \
+    echo "Downloaded gradle wrapper jar"; \
+  fi
+
+# Pre-download gradle distribution by checking gradle version
+# This ensures all dependencies are cached before the actual build
+RUN ./gradlew --version || true
+
 # Build the zuul sample distribution (skip tests to speed up builds)
 RUN ./gradlew :zuul-sample:installDist -x test --no-daemon
 
