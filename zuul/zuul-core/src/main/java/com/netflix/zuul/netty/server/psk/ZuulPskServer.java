@@ -42,6 +42,7 @@ import org.bouncycastle.tls.ProtocolVersion;
 import org.bouncycastle.tls.PskIdentity;
 import org.bouncycastle.tls.TlsCredentials;
 import org.bouncycastle.tls.TlsFatalAlert;
+import org.bouncycastle.tls.TlsPSKIdentityManager;
 import org.bouncycastle.tls.TlsPSKExternal;
 import org.bouncycastle.tls.TlsUtils;
 import org.bouncycastle.tls.crypto.TlsCrypto;
@@ -101,6 +102,27 @@ public class ZuulPskServer extends AbstractTlsServer {
     }
 
     @Override
+    public TlsPSKIdentityManager getPSKIdentityManager() {
+        return new TlsPSKIdentityManager() {
+            @Override
+            public byte[] getHint() {
+                return null;
+            }
+
+            @Override
+            public byte[] getPSK(byte[] identity) {
+                try {
+                    return externalTlsPskProvider.provide(
+                            identity,
+                            context.getSecurityParametersHandshake().getClientRandom());
+                } catch (PskCreationFailureException e) {
+                    return null;
+                }
+            }
+        };
+    }
+
+    @Override
     protected Vector getProtocolNames() {
         Vector protocolNames = new Vector();
         if (supportedApplicationProtocols != null) {
@@ -126,17 +148,19 @@ public class ZuulPskServer extends AbstractTlsServer {
     }
 
     @Override
+    public void notifySecureRenegotiation(boolean secureRenegotiation) throws IOException {
+        // This PoC uses a raw TLS client that does not send renegotiation info.
+        // Accept the initial handshake so the PSK exchange can proceed.
+    }
+
+    @Override
     protected ProtocolVersion[] getSupportedVersions() {
-        return ProtocolVersion.TLSv13.only();
+        return new ProtocolVersion[] {ProtocolVersion.TLSv13, ProtocolVersion.TLSv12};
     }
 
     @Override
     protected int[] getSupportedCipherSuites() {
-        return TlsUtils.getSupportedCipherSuites(
-                getCrypto(),
-                TlsPskHandler.SUPPORTED_TLS_PSK_CIPHER_SUITE_MAP.keySet().stream()
-                        .mapToInt(Number::intValue)
-                        .toArray());
+        return new int[] {CipherSuite.TLS_PSK_WITH_AES_128_CBC_SHA};
     }
 
     @Override
@@ -173,7 +197,7 @@ public class ZuulPskServer extends AbstractTlsServer {
             };
         }
         TlsSecret pskTlsSecret = getCrypto().createSecret(psk);
-        int prfAlgorithm = getPRFAlgorithm13(getSelectedCipherSuite());
+        int prfAlgorithm = getPskPrfAlgorithm(getSelectedCipherSuite(), getServerVersion());
         return new BasicTlsPSKExternal(clientPskIdentity, pskTlsSecret, prfAlgorithm);
     }
 
@@ -234,7 +258,14 @@ public class ZuulPskServer extends AbstractTlsServer {
         return null;
     }
 
-    private static int getPRFAlgorithm13(int cipherSuite) {
+    private static int getPskPrfAlgorithm(int cipherSuite, ProtocolVersion serverVersion) {
+        if (ProtocolVersion.TLSv12.isEqualOrEarlierVersionOf(serverVersion)) {
+            return switch (cipherSuite) {
+                case CipherSuite.TLS_PSK_WITH_AES_128_CBC_SHA -> PRFAlgorithm.tls_prf_sha256;
+                default -> -1;
+            };
+        }
+
         return switch (cipherSuite) {
             case CipherSuite.TLS_AES_128_CCM_SHA256,
                     CipherSuite.TLS_AES_128_CCM_8_SHA256,

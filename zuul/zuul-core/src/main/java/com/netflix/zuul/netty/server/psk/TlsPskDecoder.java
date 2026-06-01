@@ -35,7 +35,12 @@ public class TlsPskDecoder extends ByteToMessageDecoder {
 
     @Override
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
-        byte[] bytesRead = in.hasArray() ? in.array() : TlsPskUtils.readDirect(in);
+        // Always read exactly readableBytes() from the correct readerIndex.
+        // With -Dio.netty.noPreferDirect=true, in.hasArray() is true but in.array()
+        // returns the full backing array (pool chunk capacity, not readableBytes),
+        // which would corrupt the handshake by feeding garbage bytes into BouncyCastle.
+        // readDirect() correctly reads only the available bytes at the current position.
+        byte[] bytesRead = TlsPskUtils.readDirect(in);
         try {
             tlsPskServerProtocol.offerInput(bytesRead);
         } catch (TlsFatalAlert tlsFatalAlert) {
@@ -55,7 +60,6 @@ public class TlsPskDecoder extends ByteToMessageDecoder {
 
     private void writeOutputIfAvailable(ChannelHandlerContext ctx) {
         int availableOutputBytes = tlsPskServerProtocol.getAvailableOutputBytes();
-        // output is available immediately (handshake not complete), pipe that back to the client right away
         if (availableOutputBytes != 0) {
             byte[] outputBytes = new byte[availableOutputBytes];
             tlsPskServerProtocol.readOutput(outputBytes, 0, availableOutputBytes);
