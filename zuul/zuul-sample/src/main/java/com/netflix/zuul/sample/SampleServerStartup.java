@@ -41,15 +41,14 @@ import com.netflix.zuul.netty.server.ZuulDependencyKeys;
 import com.netflix.zuul.netty.server.ZuulServerChannelInitializer;
 import com.netflix.zuul.netty.server.http2.Http2SslChannelInitializer;
 import com.netflix.zuul.netty.server.push.PushConnectionRegistry;
+import com.netflix.zuul.netty.ssl.BaseSslContextFactory;
 import com.netflix.zuul.netty.server.psk.HardcodedPskProvider;
 import com.netflix.zuul.netty.server.psk.TlsPskHandler;
-import com.netflix.zuul.netty.ssl.BaseSslContextFactory;
 import com.netflix.zuul.sample.push.SamplePushMessageSenderInitializer;
 import com.netflix.zuul.sample.push.SampleSSEPushChannelInitializer;
 import com.netflix.zuul.sample.push.SampleWebSocketPushChannelInitializer;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelInitializer;
-import io.netty.channel.ChannelPipeline;
 import io.netty.channel.group.ChannelGroup;
 import io.netty.handler.ssl.ClientAuth;
 import java.io.File;
@@ -61,8 +60,10 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Sample Server Startup — extended with a PSK listener on port 7002 to
- * demonstrate the TlsPskHandler Use-After-Free and buffer over-read.
+ * Sample Server Startup - class that configures the Netty server startup settings
+ *
+ * Author: Arthur Gonigberg
+ * Date: November 20, 2017
  */
 public class SampleServerStartup extends BaseServerStartup {
 
@@ -72,11 +73,10 @@ public class SampleServerStartup extends BaseServerStartup {
         HTTP_MUTUAL_TLS,
         WEBSOCKET,
         SSE,
-        PSK   // ← added for PoC
+        PSK
     }
 
     private static final String[] WWW_PROTOCOLS = new String[] {"TLSv1.3", "TLSv1.2", "TLSv1.1", "TLSv1", "SSLv3"};
-    // Change to PSK to expose the vulnerable listener
     private static final ServerType SERVER_TYPE = ServerType.PSK;
     private final PushConnectionRegistry pushConnectionRegistry;
     private final SamplePushMessageSenderInitializer pushSenderInitializer;
@@ -133,7 +133,6 @@ public class SampleServerStartup extends BaseServerStartup {
             pushSockAddr = new SocketAddressProperty("zuul.server.addr.http.push", "=" + pushPort).getValue();
         }
 
-        // PSK listener address — port 7002
         SocketAddress pskSockAddr;
         {
             int pskPort = new DynamicIntProperty("zuul.server.port.psk", 7002).get();
@@ -253,9 +252,10 @@ public class SampleServerStartup extends BaseServerStartup {
                 logAddrConfigured(pushSockAddr);
             }
 
-            // ── PSK listener — exposes the vulnerable TlsPskHandler ──────────────
             case PSK -> {
-                // Plain HTTP on port 7001 so the backend/healthcheck path still works
+                // Plain HTTP on port 7001 — /healthcheck routing and the Zuul filter
+                // chain work normally here. This listener is used to verify routing works
+                // before hitting the PSK path.
                 channelConfig.set(
                         CommonChannelConfigKeys.allowProxyHeadersWhen,
                         StripUntrustedProxyHeadersHandler.AllowWhen.NEVER);
@@ -268,43 +268,31 @@ public class SampleServerStartup extends BaseServerStartup {
                         new ZuulServerChannelInitializer(metricId, channelConfig, channelDependencies, clientChannels));
                 logAddrConfigured(sockAddr);
 
-                // PSK listener on port 7002 — wraps the same HTTP pipeline under TLS-PSK
-                // using the vulnerable TlsPskHandler
-                HardcodedPskProvider pskProvider = new HardcodedPskProvider();
-                                class PskHttpChannelInitializer extends ZuulServerChannelInitializer {
-                                        PskHttpChannelInitializer(
-                                                        String metricId,
-                                                        ChannelConfig channelConfig,
-                                                        ChannelConfig channelDependencies,
-                                                        ChannelGroup channels) {
-                                                super(metricId, channelConfig, channelDependencies, channels);
-                                        }
+                // PSK listener on 7002.
+                // TlsPskHandler sits first in the pipeline. On inbound it hands off
+                // decrypted bytes to ZuulServerChannelInitializer's HTTP pipeline.
+                // On outbound (TlsPskHandler.write) the bug fires:
+                //   TlsPskUtils.getAppDataBytesAndRelease returns byteBufMsg.array()
+                //   (full heap pool chunk, not readableBytes) and frees it before use.
+                ChannelConfig pskCfg = defaultChannelConfig("psk");
+                ChannelConfig pskDeps = defaultChannelDependencies("psk");
+                pskCfg.set(CommonChannelConfigKeys.allowProxyHeadersWhen,
+                        StripUntrustedProxyHeadersHandler.AllowWhen.NEVER);
+                pskCfg.set(CommonChannelConfigKeys.preferProxyProtocolForClientIp, false);
+                pskCfg.set(CommonChannelConfigKeys.isSSlFromIntermediary, false);
+                pskCfg.set(CommonChannelConfigKeys.withProxyProtocol, false);
 
-                                        void initPskChannel(Channel ch) throws Exception {
-                                                super.initChannel(ch);
-                                        }
-                                }
+                ZuulServerChannelInitializer httpInit =
+                        new ZuulServerChannelInitializer("7002", pskCfg, pskDeps, clientChannels);
+                HardcodedPskProvider pskProvider = new HardcodedPskProvider();
+
                 addrsToChannels.put(
                         new NamedSocketAddress("psk", pskSockAddr),
                         new ChannelInitializer<Channel>() {
                             @Override
-                                                        protected void initChannel(Channel ch) throws Exception {
-                                ChannelPipeline p = ch.pipeline();
-                                // TlsPskHandler installs TlsPskDecoder via handlerAdded,
-                                // then decrypts inbound and (buggy) encrypts outbound
-                                p.addLast(new TlsPskHandler(registry, pskProvider, Set.of()));
-                                // After PSK decryption, treat the channel as plain HTTP
-                                ChannelConfig pskChannelConfig = defaultChannelConfig("psk");
-                                ChannelConfig pskChannelDeps   = defaultChannelDependencies("psk");
-                                pskChannelConfig.set(
-                                        CommonChannelConfigKeys.allowProxyHeadersWhen,
-                                        StripUntrustedProxyHeadersHandler.AllowWhen.NEVER);
-                                pskChannelConfig.set(CommonChannelConfigKeys.preferProxyProtocolForClientIp, false);
-                                pskChannelConfig.set(CommonChannelConfigKeys.isSSlFromIntermediary, false);
-                                pskChannelConfig.set(CommonChannelConfigKeys.withProxyProtocol, false);
-                                new PskHttpChannelInitializer(
-                                        "7002", pskChannelConfig, pskChannelDeps, clientChannels)
-                                        .initPskChannel(ch);
+                            protected void initChannel(Channel ch) throws Exception {
+                                ch.pipeline().addLast(new TlsPskHandler(registry, pskProvider, Set.of()));
+                                httpInit.initChannel(ch);
                             }
                         });
                 logAddrConfigured(pskSockAddr);
