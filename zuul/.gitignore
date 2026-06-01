@@ -19,7 +19,8 @@
 *.rar
 *.tar
 *.zip
-
+# DO NOT ignore the gradle wrapper jar!
+!**/gradle/wrapper/gradle-wrapper.jar
 # Logs and databases #
 ######################
 *.log
