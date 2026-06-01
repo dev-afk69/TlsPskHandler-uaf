@@ -36,6 +36,8 @@ import org.bouncycastle.tls.crypto.impl.jcajce.JcaTlsCryptoProvider;
 public class TlsPskHandler extends ChannelDuplexHandler {
 
     public static final Map<Integer, String> SUPPORTED_TLS_PSK_CIPHER_SUITE_MAP = Map.of(
+            CipherSuite.TLS_PSK_WITH_AES_128_CBC_SHA,
+            "TLS_PSK_WITH_AES_128_CBC_SHA",
             CipherSuite.TLS_AES_128_GCM_SHA256,
             "TLS_AES_128_GCM_SHA256",
             CipherSuite.TLS_AES_256_GCM_SHA384,

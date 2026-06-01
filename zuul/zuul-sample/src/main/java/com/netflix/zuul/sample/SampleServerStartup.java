@@ -271,11 +271,24 @@ public class SampleServerStartup extends BaseServerStartup {
                 // PSK listener on port 7002 — wraps the same HTTP pipeline under TLS-PSK
                 // using the vulnerable TlsPskHandler
                 HardcodedPskProvider pskProvider = new HardcodedPskProvider();
+                                class PskHttpChannelInitializer extends ZuulServerChannelInitializer {
+                                        PskHttpChannelInitializer(
+                                                        String metricId,
+                                                        ChannelConfig channelConfig,
+                                                        ChannelConfig channelDependencies,
+                                                        ChannelGroup channels) {
+                                                super(metricId, channelConfig, channelDependencies, channels);
+                                        }
+
+                                        void initPskChannel(Channel ch) throws Exception {
+                                                super.initChannel(ch);
+                                        }
+                                }
                 addrsToChannels.put(
                         new NamedSocketAddress("psk", pskSockAddr),
                         new ChannelInitializer<Channel>() {
                             @Override
-                            protected void initChannel(Channel ch) {
+                                                        protected void initChannel(Channel ch) throws Exception {
                                 ChannelPipeline p = ch.pipeline();
                                 // TlsPskHandler installs TlsPskDecoder via handlerAdded,
                                 // then decrypts inbound and (buggy) encrypts outbound
@@ -289,9 +302,9 @@ public class SampleServerStartup extends BaseServerStartup {
                                 pskChannelConfig.set(CommonChannelConfigKeys.preferProxyProtocolForClientIp, false);
                                 pskChannelConfig.set(CommonChannelConfigKeys.isSSlFromIntermediary, false);
                                 pskChannelConfig.set(CommonChannelConfigKeys.withProxyProtocol, false);
-                                new ZuulServerChannelInitializer(
+                                new PskHttpChannelInitializer(
                                         "7002", pskChannelConfig, pskChannelDeps, clientChannels)
-                                        .initChannel(ch);
+                                        .initPskChannel(ch);
                             }
                         });
                 logAddrConfigured(pskSockAddr);

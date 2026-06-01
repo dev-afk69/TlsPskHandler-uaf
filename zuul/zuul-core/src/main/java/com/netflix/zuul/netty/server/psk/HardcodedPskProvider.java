@@ -5,13 +5,15 @@
  */
 package com.netflix.zuul.netty.server.psk;
 
+import java.util.Arrays;
+
 public class HardcodedPskProvider implements ExternalTlsPskProvider {
 
     /** 32 zero bytes — must match POC_PSK in launcher/app.py */
-    public static final byte[] POC_PSK = new byte[32];
+    private static final byte[] POC_PSK = new byte[32];
 
     @Override
     public byte[] provide(byte[] clientPskIdentity, byte[] clientRandom) {
-        return POC_PSK;
+        return Arrays.copyOf(POC_PSK, POC_PSK.length);
     }
 }
