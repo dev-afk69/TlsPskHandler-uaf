@@ -76,7 +76,29 @@ public class SampleServerStartup extends BaseServerStartup {
         PSK
     }
 
-    private static final String[] WWW_PROTOCOLS = new String[] {"TLSv1.3", "TLSv1.2", "TLSv1.1", "TLSv1", "SSLv3"};
+    /**
+     * Subclass of ZuulServerChannelInitializer that exposes initChannel publicly.
+     *
+     * ZuulServerChannelInitializer.initChannel is protected, so it cannot be called
+     * from an anonymous ChannelInitializer defined in a different package.  A named
+     * subclass declared here in com.netflix.zuul.sample can override and expose the
+     * method as package-visible, allowing the PSK ChannelInitializer below to call
+     * super.initChannel(ch) through this wrapper without a compile error.
+     */
+    private static final class PskHttpInitializer extends ZuulServerChannelInitializer {
+        PskHttpInitializer(String metricId, ChannelConfig channelConfig,
+                ChannelConfig channelDependencies, ChannelGroup channels) {
+            super(metricId, channelConfig, channelDependencies, channels);
+        }
+
+        @Override
+        public void initChannel(Channel ch) throws Exception {
+            super.initChannel(ch);
+        }
+    }
+
+    private static final String[] WWW_PROTOCOLS =
+            new String[] {"TLSv1.3", "TLSv1.2", "TLSv1.1", "TLSv1", "SSLv3"};
     private static final ServerType SERVER_TYPE = ServerType.PSK;
     private final PushConnectionRegistry pushConnectionRegistry;
     private final SamplePushMessageSenderInitializer pushSenderInitializer;
@@ -253,9 +275,7 @@ public class SampleServerStartup extends BaseServerStartup {
             }
 
             case PSK -> {
-                // Plain HTTP on port 7001 — /healthcheck routing and the Zuul filter
-                // chain work normally here. This listener is used to verify routing works
-                // before hitting the PSK path.
+                // Plain HTTP on 7001 — Zuul filter chain and /healthcheck routing work here.
                 channelConfig.set(
                         CommonChannelConfigKeys.allowProxyHeadersWhen,
                         StripUntrustedProxyHeadersHandler.AllowWhen.NEVER);
@@ -269,11 +289,10 @@ public class SampleServerStartup extends BaseServerStartup {
                 logAddrConfigured(sockAddr);
 
                 // PSK listener on 7002.
-                // TlsPskHandler sits first in the pipeline. On inbound it hands off
-                // decrypted bytes to ZuulServerChannelInitializer's HTTP pipeline.
-                // On outbound (TlsPskHandler.write) the bug fires:
-                //   TlsPskUtils.getAppDataBytesAndRelease returns byteBufMsg.array()
-                //   (full heap pool chunk, not readableBytes) and frees it before use.
+                // TlsPskHandler decrypts inbound and (buggy) encrypts outbound.
+                // The bug: TlsPskUtils.getAppDataBytesAndRelease returns byteBufMsg.array()
+                // (full heap pool chunk) then frees it — writeApplicationData then encrypts
+                // the entire chunk capacity instead of just readableBytes().
                 ChannelConfig pskCfg = defaultChannelConfig("psk");
                 ChannelConfig pskDeps = defaultChannelDependencies("psk");
                 pskCfg.set(CommonChannelConfigKeys.allowProxyHeadersWhen,
@@ -282,8 +301,9 @@ public class SampleServerStartup extends BaseServerStartup {
                 pskCfg.set(CommonChannelConfigKeys.isSSlFromIntermediary, false);
                 pskCfg.set(CommonChannelConfigKeys.withProxyProtocol, false);
 
-                ZuulServerChannelInitializer httpInit =
-                        new ZuulServerChannelInitializer("7002", pskCfg, pskDeps, clientChannels);
+                // PskHttpInitializer exposes initChannel publicly so the anonymous
+                // ChannelInitializer below can call it without a compile error.
+                PskHttpInitializer httpInit = new PskHttpInitializer("7002", pskCfg, pskDeps, clientChannels);
                 HardcodedPskProvider pskProvider = new HardcodedPskProvider();
 
                 addrsToChannels.put(
