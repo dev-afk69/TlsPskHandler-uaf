@@ -1,0 +1,38 @@
+apply plugin: "java"
+apply plugin: 'application'
+
+application {
+    mainClass = "com.netflix.zuul.sample.Bootstrap"
+    applicationDefaultJvmArgs = ["-DTZ=GMT",
+                                 "-Darchaius.deployment.environment=test",
+                                 "-Dcom.sun.management.jmxremote",
+                                 "-Dcom.sun.management.jmxremote.local.only=false",
+                                 "-Deureka.validateInstanceId=false",
+                                 "-Deureka.mt.num_retries=1",
+                                 "-Dlog4j.configurationFile=log4j2.xml"]
+}
+
+dependencies {
+    implementation project(":zuul-core")
+    implementation "com.netflix.eureka:eureka-client:2.0.4"
+    implementation 'commons-configuration:commons-configuration:1.10'
+    implementation "jakarta.inject:jakarta.inject-api:2.0.1"
+    annotationProcessor project(":zuul-processor")
+
+    implementation 'org.apache.logging.log4j:log4j-core:2.25.1'
+    implementation 'org.apache.logging.log4j:log4j-api:2.25.1'
+    implementation 'org.apache.logging.log4j:log4j-slf4j-impl:2.25.1'
+    implementation 'org.slf4j:slf4j-simple:2.0.17'
+}
+
+/*
+ * Run regular:   ./gradlew run
+ * Run benchmark: ./gradlew run -Pbench
+ */
+run {
+    if (project.hasProperty('bench')) {
+        println 'Running benchmark configuration...'
+        jvmArgs "-Darchaius.deployment.environment=benchmark"
+    }
+}
+

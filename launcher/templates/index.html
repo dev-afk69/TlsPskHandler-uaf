@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CVE — Zuul TlsPskHandler Memory Disclosure</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,600;1,400&family=IBM+Plex+Sans:wght@400;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+
+    <header class="header">
+      <div class="header-inner">
+        <div class="header-left">
+          <div class="severity-badge">CRITICAL</div>
+          <h1>TlsPskHandler<br><span class="accent">Memory Disclosure</span></h1>
+          <p class="subtitle">
+            Use-After-Free &amp; Buffer Over-Read in Zuul's TLS-PSK outbound write path.
+            A single PSK connection receives the full Netty pool chunk (up to 16 KB)
+            instead of the actual payload — leaking stale cross-channel data in plaintext
+            after decryption.
+          </p>
+        </div>
+        <div class="header-right">
+          <div class="stat-grid">
+            <div class="stat-box" id="stat-probes">
+              <div class="stat-label">probes run</div>
+              <div class="stat-value" id="stat-probes-val">0</div>
+            </div>
+            <div class="stat-box" id="stat-overflow">
+              <div class="stat-label">total overflow</div>
+              <div class="stat-value" id="stat-overflow-val">0 B</div>
+            </div>
+            <div class="stat-box" id="stat-max">
+              <div class="stat-label">max per probe</div>
+              <div class="stat-value" id="stat-max-val">0 B</div>
+            </div>
+            <div class="stat-box" id="stat-status">
+              <div class="stat-label">status</div>
+              <div class="stat-value" id="stat-status-val">idle</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <main class="main">
+
+      <!-- Step 1: verify connection -->
+      <section class="panel">
+        <div class="panel-head">
+          <span class="step-num">01</span>
+          <div>
+            <h2>Verify PSK Handshake</h2>
+            <p class="panel-desc">
+              Opens one TLS 1.2 PSK connection to <code>zuul-service:7002</code> using the
+              hardcoded 32-byte zero key. Confirms the vulnerable listener is reachable before
+              running the full probe sequence.
+            </p>
+          </div>
+        </div>
+        <div class="code-block">
+          <div class="code-label">config</div>
+          <pre>target   zuul-service:{{ zuul_psk_port }}
+psk_key  {{ '00' * 16 }} (32 bytes, all zero)
+         {{ '00' * 16 }}
+identity poc-client
+suite    TLS_PSK_WITH_AES_128_CBC_SHA (0x008c)</pre>
+        </div>
+        <div class="panel-actions">
+          <button class="btn btn-secondary" id="handshake-btn">run handshake check</button>
+          <span class="action-hint">one connection, no data collection</span>
+        </div>
+        <div id="handshake-result" class="result-block hidden"></div>
+      </section>
+
+      <!-- Step 2: run disclosure flood -->
+      <section class="panel">
+        <div class="panel-head">
+          <span class="step-num">02</span>
+          <div>
+            <h2>Run Disclosure Probes</h2>
+            <p class="panel-desc">
+              Sends {{ probe_count }} sequential PSK connections. Each probe transmits an
+              84-byte HTTP GET and measures decrypted bytes returned. A correct server
+              returns ~200 bytes. The buggy <code>TlsPskHandler</code> returns the full
+              Netty pool chunk — the extra bytes are stale pooled memory from prior connections.
+            </p>
+          </div>
+        </div>
+
+        <div class="vuln-diagram">
+          <div class="diag-col">
+            <div class="diag-label">probe sends</div>
+            <div class="diag-box diag-small">84 B<br><span class="diag-note">HTTP GET /healthcheck</span></div>
+          </div>
+          <div class="diag-arrow">→</div>
+          <div class="diag-col">
+            <div class="diag-label">expected response</div>
+            <div class="diag-box diag-medium">~200 B<br><span class="diag-note">HTTP 200 + body</span></div>
+          </div>
+          <div class="diag-arrow accent-arrow">→</div>
+          <div class="diag-col">
+            <div class="diag-label">actual response (bug)</div>
+            <div class="diag-box diag-large">2048–16384 B<br><span class="diag-note">pool chunk capacity<br>= payload + stale data</span></div>
+          </div>
+        </div>
+
+        <div class="panel-actions">
+          <button class="btn btn-primary" id="flood-btn">run {{ probe_count }} probes</button>
+          <button class="btn btn-ghost" id="clear-btn">clear results</button>
+        </div>
+
+        <div id="flood-status" class="hidden">
+          <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+          <div class="progress-label" id="progress-label">running probe 0 / {{ probe_count }}</div>
+        </div>
+
+        <div id="flood-summary" class="hidden">
+          <div class="summary-grid">
+            <div class="summary-item">
+              <div class="summary-label">probes succeeded</div>
+              <div class="summary-value" id="sum-success">—</div>
+            </div>
+            <div class="summary-item">
+              <div class="summary-label">probes failed</div>
+              <div class="summary-value" id="sum-fail">—</div>
+            </div>
+            <div class="summary-item">
+              <div class="summary-label">total leaked bytes</div>
+              <div class="summary-value overflow-val" id="sum-overflow">—</div>
+            </div>
+            <div class="summary-item">
+              <div class="summary-label">largest single leak</div>
+              <div class="summary-value overflow-val" id="sum-max">—</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Step 3: probe results table -->
+      <section class="panel" id="results-panel" style="display:none">
+        <div class="panel-head">
+          <span class="step-num">03</span>
+          <div>
+            <h2>Probe Results</h2>
+            <p class="panel-desc">
+              Per-probe breakdown. <strong>Overflow bytes</strong> is
+              <code>bytes_received − 512</code> (conservative ceiling for a valid response).
+              Any non-zero value is evidence of over-read pooled memory.
+              Expand a row to see the raw hex tail — those bytes did not come from
+              your HTTP response.
+            </p>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="results-table" id="results-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>status</th>
+                <th>bytes rx</th>
+                <th>overflow</th>
+                <th>response</th>
+                <th>ms</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="results-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Root cause callout -->
+      <section class="panel panel-callout">
+        <div class="panel-head">
+          <span class="step-num">04</span>
+          <div>
+            <h2>Root Cause</h2>
+          </div>
+        </div>
+        <div class="code-block code-block-diff">
+          <div class="code-label">TlsPskUtils.java — the vulnerable method</div>
+          <pre><span class="diff-remove">// BEFORE (vulnerable)</span>
+<span class="diff-remove">protected static byte[] getAppDataBytesAndRelease(ByteBuf byteBufMsg) {</span>
+<span class="diff-remove">    byte[] appDataBytes = byteBufMsg.hasArray()</span>
+<span class="diff-remove">        ? byteBufMsg.array()           // ← full backing array (pool chunk capacity)</span>
+<span class="diff-remove">        : TlsPskUtils.readDirect(byteBufMsg);</span>
+<span class="diff-remove">    ReferenceCountUtil.safeRelease(byteBufMsg);  // ← freed before use</span>
+<span class="diff-remove">    return appDataBytes;               // ← returns freed array</span>
+<span class="diff-remove">}</span>
+
+<span class="diff-comment">// TlsPskHandler.write then calls:</span>
+<span class="diff-remove">tlsPskServerProtocol.writeApplicationData(appDataBytes, 0, appDataBytes.length);</span>
+<span class="diff-remove">//                                                       ↑           ↑</span>
+<span class="diff-remove">//                                               offset=0  len=capacity (NOT readableBytes)</span></pre>
+        </div>
+        <div class="two-col">
+          <div>
+            <h3 class="finding-head">Use-After-Free</h3>
+            <p>
+              <code>safeRelease</code> is called before <code>writeApplicationData</code>
+              consumes the array. The Netty pool can reallocate that memory to another
+              channel mid-encryption, causing a data race and potential cross-channel
+              data corruption.
+            </p>
+          </div>
+          <div>
+            <h3 class="finding-head">Buffer Over-Read (Heartbleed-style)</h3>
+            <p>
+              <code>appDataBytes.length</code> is the <em>pool chunk capacity</em>
+              (e.g. 2048, 4096, or 16384 bytes), not <code>readableBytes()</code>.
+              The extra bytes are stale heap data — HTTP headers, tokens, and cookies
+              from earlier requests on that pooled buffer — encrypted and sent to
+              the attacker verbatim.
+            </p>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

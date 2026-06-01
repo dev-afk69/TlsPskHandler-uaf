@@ -1,0 +1,167 @@
+/*
+ * Copyright 2019 Netflix, Inc.
+ *
+ *      Licensed under the Apache License, Version 2.0 (the "License");
+ *      you may not use this file except in compliance with the License.
+ *      You may obtain a copy of the License at
+ *
+ *          http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *      Unless required by applicable law or agreed to in writing, software
+ *      distributed under the License is distributed on an "AS IS" BASIS,
+ *      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *      See the License for the specific language governing permissions and
+ *      limitations under the License.
+ */
+
+package com.netflix.netty.common;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import com.google.common.net.InetAddresses;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.embedded.EmbeddedChannel;
+import java.net.Inet4Address;
+import java.net.Inet6Address;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.NetworkInterface;
+import java.net.SocketAddress;
+import java.net.UnknownHostException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.junit.jupiter.api.Assumptions;
+import org.junit.jupiter.api.Test;
+import org.opentest4j.TestAbortedException;
+
+/**
+ * Unit tests for {@link SourceAddressChannelHandler}.
+ */
+class SourceAddressChannelHandlerTest {
+
+    @Test
+    void ipv6AddressScopeIdRemoved() throws Exception {
+        Inet6Address address =
+                Inet6Address.getByAddress("localhost", new byte[] {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, 2);
+        assertThat(address.getScopeId()).isEqualTo(2);
+
+        String addressString = SourceAddressChannelHandler.getHostAddress(new InetSocketAddress(address, 8080));
+
+        assertThat(addressString).isEqualTo("0:0:0:0:0:0:0:1");
+    }
+
+    @Test
+    void ipv4AddressString() throws Exception {
+        InetAddress address = Inet4Address.getByAddress("localhost", new byte[] {127, 0, 0, 1});
+
+        String addressString = SourceAddressChannelHandler.getHostAddress(new InetSocketAddress(address, 8080));
+
+        assertThat(addressString).isEqualTo("127.0.0.1");
+    }
+
+    @Test
+    void failsOnUnresolved() {
+        InetSocketAddress address = InetSocketAddress.createUnresolved("localhost", 8080);
+
+        String addressString = SourceAddressChannelHandler.getHostAddress(address);
+
+        assertThat(addressString).isNull();
+    }
+
+    @Test
+    void mapsIpv4AddressFromIpv6Address() throws Exception {
+        // Can't think of a reason why this would ever come up, but testing it just in case.
+        // ::ffff:127.0.0.1
+        Inet6Address address = Inet6Address.getByAddress(
+                "localhost", new byte[] {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, (byte) 0xFF, (byte) 0xFF, 127, 0, 0, 1}, -1);
+        assertThat(address.getScopeId()).isEqualTo(0);
+
+        String addressString = SourceAddressChannelHandler.getHostAddress(new InetSocketAddress(address, 8080));
+
+        assertThat(addressString).isEqualTo("127.0.0.1");
+    }
+
+    @Test
+    void ipv6AddressScopeNameRemoved() throws Exception {
+        List<NetworkInterface> nics = Collections.list(NetworkInterface.getNetworkInterfaces());
+        Assumptions.assumeTrue(!nics.isEmpty(), "No network interfaces");
+
+        List<Throwable> failures = new ArrayList<>();
+        for (NetworkInterface nic : nics) {
+            Inet6Address address;
+            try {
+                address = Inet6Address.getByAddress(
+                        "localhost", new byte[] {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, nic);
+            } catch (UnknownHostException e) {
+                // skip, the nic doesn't match
+                failures.add(e);
+                continue;
+            }
+
+            assertThat(address.toString().contains("%")).as(address.toString()).isTrue();
+
+            String addressString = SourceAddressChannelHandler.getHostAddress(new InetSocketAddress(address, 8080));
+
+            assertThat(addressString).isEqualTo("0:0:0:0:0:0:0:1");
+            return;
+        }
+
+        TestAbortedException failure = new TestAbortedException("No Compatible Nics were found");
+        failures.forEach(failure::addSuppressed);
+        throw failure;
+    }
+
+    @Test
+    @SuppressWarnings("deprecation")
+    void handlerRemovedAfterActive() {
+        InetSocketAddress remoteAddr = new InetSocketAddress(InetAddresses.forString("175.45.177.0"), 12345);
+        InetSocketAddress localAddr = new InetSocketAddress(InetAddresses.forString("127.0.0.1"), 8080);
+
+        AtomicBoolean activeSeen = new AtomicBoolean();
+        EmbeddedChannel channel =
+                new EmbeddedChannel(new SourceAddressChannelHandler(), new ChannelInboundHandlerAdapter() {
+                    @Override
+                    public void channelActive(ChannelHandlerContext ctx) {
+                        activeSeen.set(true);
+                    }
+                }) {
+                    @Override
+                    protected SocketAddress remoteAddress0() {
+                        return remoteAddr;
+                    }
+
+                    @Override
+                    protected SocketAddress localAddress0() {
+                        return localAddr;
+                    }
+                };
+
+        assertThat(activeSeen).isTrue();
+        assertThat(channel.pipeline().get(SourceAddressChannelHandler.class)).isNull();
+
+        assertThat(channel.attr(SourceAddressChannelHandler.ATTR_REMOTE_ADDR).get())
+                .isEqualTo(remoteAddr);
+        assertThat(channel.attr(SourceAddressChannelHandler.ATTR_SOURCE_INET_ADDR)
+                        .get())
+                .isEqualTo(remoteAddr);
+        assertThat(channel.attr(SourceAddressChannelHandler.ATTR_SOURCE_ADDRESS).get())
+                .isEqualTo("175.45.177.0");
+
+        assertThat(channel.attr(SourceAddressChannelHandler.ATTR_LOCAL_ADDR).get())
+                .isEqualTo(localAddr);
+        assertThat(channel.attr(SourceAddressChannelHandler.ATTR_LOCAL_INET_ADDR)
+                        .get())
+                .isEqualTo(localAddr);
+        assertThat(channel.attr(SourceAddressChannelHandler.ATTR_LOCAL_ADDRESS).get())
+                .isEqualTo("127.0.0.1");
+        assertThat(channel.attr(SourceAddressChannelHandler.ATTR_SERVER_LOCAL_ADDRESS)
+                        .get())
+                .isEqualTo("127.0.0.1");
+        assertThat(channel.attr(SourceAddressChannelHandler.ATTR_SERVER_LOCAL_PORT)
+                        .get())
+                .isEqualTo(8080);
+    }
+}

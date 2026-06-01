@@ -1,0 +1,157 @@
+import net.ltgt.gradle.errorprone.CheckSeverity
+
+buildscript {
+    dependencies {
+        classpath 'com.palantir.javaformat:gradle-palantir-java-format:2.83.0'
+    }
+}
+
+plugins {
+    id 'com.netflix.nebula.netflixoss' version '13.0.0'
+    id "com.google.osdetector" version '1.7.3'
+    id 'me.champeau.jmh' version '0.7.2'
+    id 'org.openrewrite.rewrite' version '7.12.1'
+    id 'net.ltgt.errorprone' version '4.1.0'
+    id 'com.diffplug.spotless' version "8.1.0"
+    id 'idea'
+}
+
+ext.githubProjectName = rootProject.name
+
+
+idea {
+    project {
+        languageLevel = '21'
+    }
+}
+
+configurations.all {
+    exclude group: 'asm', module: 'asm'
+    exclude group: 'asm', module: 'asm-all'
+}
+
+allprojects {
+    repositories {
+        mavenCentral()
+    }
+
+    apply plugin: 'com.diffplug.spotless'
+
+    spotless {
+        enforceCheck false
+        java {
+            rootProject.hasProperty('spotlessJavaTarget') ? target(rootProject.getProperty('spotlessJavaTarget').split(",")) : target('src/*/java/**/*.java')
+            removeUnusedImports('cleanthat-javaparser-unnecessaryimport')
+            palantirJavaFormat()
+        }
+    }
+}
+
+subprojects {
+    apply plugin: 'com.netflix.nebula.netflixoss'
+    apply plugin: 'java'
+    apply plugin: 'com.netflix.nebula.javadoc-jar'
+    apply plugin: 'com.netflix.nebula.dependency-lock'
+    apply plugin: 'me.champeau.jmh'
+    apply plugin: 'org.openrewrite.rewrite'
+    apply plugin: 'net.ltgt.errorprone'
+
+    license {
+        ignoreFailures = false
+        excludes([
+                "**/META-INF/services/javax.annotation.processing.Processor",
+                "**/META-INF/gradle/incremental.annotation.processors",
+                "**/*.cert",
+                "**/*.jks",
+                "**/*.key",
+        ])
+    }
+
+    group = "com.netflix.${githubProjectName}"
+
+    java {
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(21)
+        }
+    }
+
+    tasks.withType(JavaCompile).configureEach {
+        dependencies {
+            errorprone "com.uber.nullaway:nullaway:0.13.1"
+            errorprone "com.google.errorprone:error_prone_core:2.45.0"
+        }
+
+        options.compilerArgs << "-Werror"
+
+        options.errorprone {
+            enabled = !name.contains('Jmh') && !name.contains('Test')
+            check("NullAway", CheckSeverity.ERROR)
+            option("NullAway:OnlyNullMarked", "true")
+            errorproneArgs.addAll(
+                // Uncomment and remove -Werror javac flag to automatically apply fixes for a check.
+                // N.B: disables all other checks while enabled.
+                // "-XepPatchChecks:UnnecessaryParentheses",
+                // "-XepPatchLocation:IN_PLACE",
+                "-Xep:ClassCanBeStatic:OFF",
+                "-Xep:EmptyBlockTag:OFF",
+                "-Xep:FutureReturnValueIgnored:OFF",
+                "-Xep:InlineMeSuggester:OFF",
+                "-Xep:MissingSummary:OFF",
+                "-Xep:StringConcatToTextBlock:OFF",
+                "-Xep:AssignmentExpression:OFF",
+            )
+        }
+    }
+
+    eclipse {
+        classpath {
+            downloadSources = true
+            downloadJavadoc = true
+        }
+    }
+
+    tasks.withType(Javadoc).each {
+        it.classpath = sourceSets.main.compileClasspath
+        // Ignore Javadoc warnings for now, re-enable after Zuul 3.
+        it.options.addStringOption('Xdoclint:none', '-quiet')
+    }
+
+    ext {
+        libraries = [
+                guava: "com.google.guava:guava:33.3.0-jre",
+                okhttp: 'com.squareup.okhttp3:okhttp:4.12.0',
+                jupiterApi: 'org.junit.jupiter:junit-jupiter-api:5.13.+',
+                jupiterParams: 'org.junit.jupiter:junit-jupiter-params:5.13.+',
+                jupiterEngine: 'org.junit.jupiter:junit-jupiter-engine:5.13.+',
+                junitPlatformLauncher: 'org.junit.platform:junit-platform-launcher:1.13.+',
+                jupiterMockito: 'org.mockito:mockito-junit-jupiter:5.13.+',
+                mockito: 'org.mockito:mockito-core:5.+',
+
+                slf4j: "org.slf4j:slf4j-api:2.0.16",
+                assertj: 'org.assertj:assertj-core:3.26.3',
+                awaitility: 'org.awaitility:awaitility:4.2.2',
+                lombok: 'org.projectlombok:lombok:1.18.42'
+        ]
+    }
+
+    test {
+        useJUnitPlatform()
+        testLogging {
+            showStandardStreams = true
+        }
+        maxParallelForks = Runtime.runtime.availableProcessors();
+    }
+}
+
+dependencies {
+    rewrite(platform("org.openrewrite.recipe:rewrite-recipe-bom:3.12.1"))
+    rewrite("org.openrewrite.recipe:rewrite-logging-frameworks")
+    rewrite("org.openrewrite.recipe:rewrite-testing-frameworks")
+    rewrite("org.openrewrite.recipe:rewrite-static-analysis")
+}
+
+rewrite {
+    failOnDryRunResults = true
+    activeRecipe("org.openrewrite.java.testing.junit5.JUnit5BestPractices")
+    activeRecipe("org.openrewrite.java.logging.slf4j.Slf4jBestPractices")
+}
