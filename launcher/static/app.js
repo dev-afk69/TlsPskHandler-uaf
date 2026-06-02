@@ -22,6 +22,10 @@ const sumSuccess     = document.getElementById("sum-success");
 const sumFail        = document.getElementById("sum-fail");
 const sumOverflow    = document.getElementById("sum-overflow");
 const sumMax         = document.getElementById("sum-max");
+const logsBtn        = document.getElementById("logs-btn");
+const logsMeta       = document.getElementById("logs-meta");
+const logsResult     = document.getElementById("logs-result");
+const logsOutput     = document.getElementById("logs-output");
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
@@ -41,7 +45,7 @@ function setStatus(text, cls) {
 handshakeBtn.addEventListener("click", async () => {
   handshakeBtn.disabled = true;
   handshakeRes.className = "result-block";
-  handshakeRes.textContent = "connecting…";
+  handshakeRes.textContent = "checking listener...";
   setStatus("connecting", "");
 
   try {
@@ -51,7 +55,7 @@ handshakeBtn.addEventListener("click", async () => {
     if (data.ok) {
       handshakeRes.className = "result-block is-ok";
       handshakeRes.textContent =
-        `handshake ok — ${data.bytes_received} bytes received in ${data.elapsed_ms}ms\n` +
+        `listener check ok in ${data.elapsed_ms}ms\n` +
         `response: ${data.response_first_line}`;
       setStatus("connected", "is-ok");
     } else {
@@ -66,6 +70,42 @@ handshakeBtn.addEventListener("click", async () => {
   }
 
   handshakeBtn.disabled = false;
+});
+
+// ── Evidence logs ─────────────────────────────────────────────────────────────
+
+logsBtn.addEventListener("click", async () => {
+  logsBtn.disabled = true;
+  logsResult.className = "result-block";
+  logsResult.classList.remove("hidden");
+  logsResult.textContent = "loading docker evidence logs...";
+
+  try {
+    const res = await fetch("/evidence/logs");
+    const data = await res.json();
+
+    if (data.ok) {
+      const lines = data.lines || [];
+      logsMeta.textContent = `${lines.length} matched lines in ${data.elapsed_ms}ms`;
+      logsOutput.textContent = lines.length > 0
+        ? lines.join("\n")
+        : "No matching evidence lines found in recent logs. Trigger a probe and refresh.";
+      logsResult.className = "result-block is-ok";
+      logsResult.textContent = `evidence logs fetched\ncommand: ${data.command}`;
+    } else {
+      logsMeta.textContent = "log pull failed";
+      logsOutput.textContent = "";
+      logsResult.className = "result-block is-err";
+      logsResult.textContent = `error: ${data.error || "unknown"}\ncommand: ${data.command || "n/a"}`;
+    }
+  } catch (err) {
+    logsMeta.textContent = "log pull failed";
+    logsOutput.textContent = "";
+    logsResult.className = "result-block is-err";
+    logsResult.textContent = "fetch failed: " + err.message;
+  }
+
+  logsBtn.disabled = false;
 });
 
 // ── Flood probes ──────────────────────────────────────────────────────────────

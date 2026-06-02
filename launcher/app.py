@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import http.client
 import os
+import re
+import socket
 import subprocess
 import time
+from urllib.parse import quote
 
 from flask import Flask, Response, jsonify, render_template
 
@@ -19,6 +23,26 @@ PSK_IDENTITY = "poc-client"
 #   HTTP/1.1 200 OK\r\n + headers + \r\n + "healthy" = well under 512 bytes.
 # Any bytes received above this ceiling are stale pooled memory from the Netty heap chunk.
 EXPECTED_CEILING = 512
+EVIDENCE_CONTAINER = os.environ.get("ZUUL_CONTAINER_NAME", "psk-poc-zuul")
+DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
+
+EVIDENCE_PATTERNS = [
+    re.compile(r"finished startup", re.IGNORECASE),
+    re.compile(r"7002"),
+    re.compile(r"psk", re.IGNORECASE),
+    re.compile(r"SslHandshakeCompletionEvent", re.IGNORECASE),
+]
+
+
+class UnixSocketHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, unix_socket_path: str, timeout: float = 5) -> None:
+        super().__init__("localhost", timeout=timeout)
+        self.unix_socket_path = unix_socket_path
+
+    def connect(self) -> None:
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.unix_socket_path)
 
 # The HTTP request sent on every probe — 84 bytes.
 HTTP_REQUEST = (
@@ -94,6 +118,20 @@ def _openssl_probe(send_http: bool) -> dict:
     return {"ok": True, "stdout": stdout, "stderr": stderr, "elapsed_ms": elapsed_ms}
 
 
+def _tcp_connect_check(timeout_seconds: float = 2.0) -> dict:
+    """Quick liveness check for the PSK listener socket."""
+    started = time.monotonic()
+    try:
+        with socket.create_connection((ZUUL_HOST, ZUUL_PSK_PORT), timeout=timeout_seconds):
+            pass
+    except OSError as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        return {"ok": False, "error": str(exc), "elapsed_ms": elapsed_ms}
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    return {"ok": True, "elapsed_ms": elapsed_ms}
+
+
 def run_raw_probe(index: int) -> dict:
     """
     One PSK connection.  Sends HTTP_REQUEST, reads back everything the server
@@ -136,6 +174,72 @@ def run_raw_probe(index: int) -> dict:
     return result
 
 
+def _fetch_evidence_logs() -> dict:
+    """Read recent Zuul container logs and keep only proof-relevant lines."""
+    started = time.monotonic()
+    since = int(time.time()) - (20 * 60)
+    path = (
+        f"/containers/{quote(EVIDENCE_CONTAINER, safe='')}/logs"
+        f"?stdout=1&stderr=1&tail=500&since={since}&timestamps=1"
+    )
+
+    try:
+        conn = UnixSocketHTTPConnection(DOCKER_SOCK, timeout=5)
+        conn.request("GET", path)
+        response = conn.getresponse()
+        status = response.status
+        body = response.read()
+        conn.close()
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        return {
+            "ok": False,
+            "error": f"docker socket read failed: {exc}",
+            "elapsed_ms": elapsed_ms,
+            "command": f"GET {path} via {DOCKER_SOCK}",
+        }
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    if status != 200:
+        return {
+            "ok": False,
+            "error": f"docker api returned status {status}",
+            "elapsed_ms": elapsed_ms,
+            "command": f"GET {path} via {DOCKER_SOCK}",
+        }
+
+    if len(body) >= 8 and body[0] in (0, 1, 2):
+        # Docker raw-stream format: 8-byte header + payload per frame.
+        i = 0
+        chunks: list[bytes] = []
+        while i + 8 <= len(body):
+            frame_len = int.from_bytes(body[i + 4:i + 8], byteorder="big", signed=False)
+            start = i + 8
+            end = start + frame_len
+            if end > len(body):
+                break
+            chunks.append(body[start:end])
+            i = end
+        decoded = b"".join(chunks)
+    else:
+        decoded = body
+
+    log_text = decoded.decode("utf-8", errors="replace")
+
+    matches: list[str] = []
+    for line in log_text.splitlines():
+        if any(pattern.search(line) for pattern in EVIDENCE_PATTERNS):
+            matches.append(line)
+
+    return {
+        "ok": True,
+        "elapsed_ms": elapsed_ms,
+        "command": f"GET {path} via {DOCKER_SOCK}",
+        "lines": matches[-200:],
+        "count": len(matches),
+    }
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -150,13 +254,13 @@ def index() -> str:
 
 @app.post("/run/handshake")
 def run_handshake() -> tuple[Response, int]:
-    """Complete a real TLS 1.2 PSK handshake without sending HTTP data."""
-    r = _openssl_probe(send_http=False)
+    """Fast socket-level reachability check for the PSK listener."""
+    r = _tcp_connect_check()
     if r["ok"]:
         return jsonify({
             "ok": True,
             "bytes_received": 0,
-            "response_first_line": "TLS-PSK handshake completed",
+            "response_first_line": "TCP connect to PSK listener succeeded",
             "elapsed_ms": r["elapsed_ms"],
         }), 200
     return jsonify({"ok": False, "error": r.get("error", "unknown")}), 500
@@ -178,6 +282,14 @@ def run_leak() -> tuple[Response, int]:
         "max_overflow_bytes": max_overflow,
         "results": results,
     }), 200
+
+
+@app.get("/evidence/logs")
+def evidence_logs() -> tuple[Response, int]:
+    result = _fetch_evidence_logs()
+    if result.get("ok"):
+        return jsonify(result), 200
+    return jsonify(result), 500
 
 
 if __name__ == "__main__":
